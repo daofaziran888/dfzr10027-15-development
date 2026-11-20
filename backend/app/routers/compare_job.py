@@ -65,6 +65,23 @@ def export_entries(
         headers={"Content-Disposition": 'attachment; filename="compare_job.csv"'})
 
 
+@router.post("/attribution-diff", response_model=ActionResult)
+def attribution_diff(payload: dict[str, object]) -> ActionResult:
+    """基于归因批次同步计算两个窗口口径的渠道模型差异，返回成交范围与未覆盖金额。"""
+    batch_id = str(payload.get("batch_id") or "").strip()
+    baseline_window = str(payload.get("baseline_window") or "").strip()
+    comparison_window = str(payload.get("comparison_window") or "").strip()
+    if not batch_id or not baseline_window or not comparison_window:
+        return ActionResult(
+            ok=False,
+            message="缺少必填字段：batch_id、baseline_window、comparison_window",
+        )
+    result, message = service.attribution_window_diff(batch_id, baseline_window, comparison_window)
+    if result is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=result)
+
+
 @router.get("/{entry_id}", response_model=dict)
 def get_entry(entry_id: int) -> dict:
     """读取单条对比任务明细；不存在时给出可读的错误说明。"""

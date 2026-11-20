@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.attribution_batch import attribution_batch_service
 from app.store import store
 
 MODULE = "compare_job"
@@ -63,3 +64,68 @@ class CompareJobService:
         entry["pending"] = target != STATUS_ORDER[-1]
         entry["abnormal"] = action in NEGATIVE_ACTIONS
         return entry, f"对比任务已{action}"
+
+    def attribution_window_diff(
+        self, batch_id: str, baseline_window: str, comparison_window: str
+    ) -> tuple[dict[str, Any] | None, str]:
+        """基于同一批归因成交同步计算两个窗口口径的渠道模型差异。
+
+        结果同时携带计算份额时使用的成交范围与未覆盖金额，让分析人员区分
+        份额变化来自归因规则调整，还是进入对比的成交覆盖范围缩小。
+        """
+        comparison, message = attribution_batch_service.compare_windows(
+            batch_id, baseline_window, comparison_window)
+        if comparison is None:
+            return None, message
+
+        baseline = comparison["baseline"]
+        target = comparison["comparison"]
+        scope_note = {
+            "batch_id": batch_id,
+            "baseline_window": baseline["window"],
+            "comparison_window": target["window"],
+            "conversion_scope": {
+                "order_count": baseline["scope"]["order_count"],
+                "order_ids": baseline["scope"]["order_ids"],
+                "total_amount": baseline["scope"]["total_amount"],
+            },
+            "scope_changed": (
+                baseline["scope"]["total_amount"] != target["scope"]["total_amount"]
+                or baseline["scope"]["order_count"] != target["scope"]["order_count"]
+            ),
+            "coverage": {
+                baseline["window"]: {
+                    model: {
+                        "allocated": baseline["model_summaries"][model]["allocated"],
+                        "uncovered": baseline["model_summaries"][model]["uncovered"],
+                    }
+                    for model in baseline["model_summaries"]
+                },
+                target["window"]: {
+                    model: {
+                        "allocated": target["model_summaries"][model]["allocated"],
+                        "uncovered": target["model_summaries"][model]["uncovered"],
+                    }
+                    for model in target["model_summaries"]
+                },
+            },
+        }
+        diff_payload = {
+            "diff": comparison,
+            "scope_note": scope_note,
+            "compare_rows": comparison["compare_rows"],
+            "scope_rows": comparison["scope_rows"],
+        }
+
+        # 差异行数按份额确实发生变化的渠道-模型组合统计。
+        diff_count = sum(1 for row in comparison["compare_rows"] if row["份额差异"] != 0.0)
+        for row in store.rows(MODULE):
+            if row.get("任务编号") == "COMP-ATTRIBUTION":
+                row["差异行数"] = str(diff_count)
+                row["处理结论"] = (
+                    f"同批{baseline['scope']['order_count']}笔成交，"
+                    f"未覆盖金额 {baseline['scope']['uncovered_amount']} -> "
+                    f"{target['scope']['uncovered_amount']}，份额差异行 {diff_count} 条"
+                )
+                row["attribution_diff"] = diff_payload
+        return diff_payload, "归因窗口模型差异已同步计算"

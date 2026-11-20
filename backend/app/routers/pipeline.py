@@ -77,8 +77,9 @@ def trigger_quality_scan() -> ActionResult:
 @router.post("/attribution-compare", response_model=ActionResult)
 def trigger_attribution_compare(
     link_code: str | None = Query(default=None, description="链路编号"),
+    window: str | None = Query(default=None, description="归因窗口口径，如 7天；缺省取链路业务配置"),
 ) -> ActionResult:
-    result = run_attribution_compare_pipeline(link_code)
+    result = run_attribution_compare_pipeline(link_code, window)
     return ActionResult(ok=True, message="归因对比管道已执行", entry=result)
 
 

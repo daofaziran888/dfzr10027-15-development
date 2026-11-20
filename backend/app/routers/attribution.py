@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services.attribution import AttributionService
+from app.services.attribution_batch import attribution_batch_service
 
 router = APIRouter(prefix="/api/attribution", tags=["归因模型"])
 
@@ -63,6 +64,54 @@ def export_entries(
     return StreamingResponse(
         iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="attribution.csv"'})
+
+
+@router.get("/batches", response_model=dict)
+def list_batches() -> dict[str, object]:
+    """列出已提交的归因批次及其已计算的窗口口径。"""
+    batches = attribution_batch_service.list_batches()
+    return {"items": batches, "total": len(batches)}
+
+
+@router.post("/batches", response_model=ActionResult)
+def submit_batch(payload: dict[str, object]) -> ActionResult:
+    """提交一批触点与成交数据；同一 batch_id 重复提交返回同一快照，不重复入账。"""
+    batch, message = attribution_batch_service.submit_batch(payload)
+    if batch is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=batch)
+
+
+@router.get("/batches/{batch_id}", response_model=dict)
+def get_batch(batch_id: str) -> dict:
+    """读取单个归因批次的原始数据与各窗口计算快照。"""
+    batch = attribution_batch_service.get_batch(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail=f"归因批次 {batch_id} 不存在")
+    return batch
+
+
+@router.post("/batches/{batch_id}/compute", response_model=ActionResult)
+def compute_window(batch_id: str, payload: dict[str, object]) -> ActionResult:
+    """按业务配置的窗口口径计算该批次的首次、末次、线性归因与未覆盖金额。"""
+    window = payload.get("window") if payload else None
+    result, message = attribution_batch_service.compute_window(batch_id, None if window is None else str(window))
+    if result is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=result)
+
+
+@router.post("/batches/{batch_id}/compare-windows", response_model=ActionResult)
+def compare_windows(batch_id: str, payload: dict[str, object]) -> ActionResult:
+    """同一批成交在两个窗口口径下同步计算渠道份额差异、成交范围与未覆盖金额。"""
+    baseline_window = str(payload.get("baseline_window") or "").strip()
+    comparison_window = str(payload.get("comparison_window") or "").strip()
+    if not baseline_window or not comparison_window:
+        return ActionResult(ok=False, message="缺少必填字段：baseline_window、comparison_window")
+    result, message = attribution_batch_service.compare_windows(batch_id, baseline_window, comparison_window)
+    if result is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=result)
 
 
 @router.get("/{entry_id}", response_model=dict)

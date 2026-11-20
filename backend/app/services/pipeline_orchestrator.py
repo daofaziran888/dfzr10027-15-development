@@ -20,6 +20,7 @@ from app.fixtures import (
     QUALITY_CHECK_SAMPLES,
     TREND_POINTS,
 )
+from app.services.attribution_engine import MODEL_LABELS, MODELS, compute_attribution
 from app.store import store
 
 # ---------------------------------------------------------------------------
@@ -396,8 +397,15 @@ def run_quality_scan() -> dict[str, Any]:
 # Pipeline 7: attribution -> metric_def -> compare_job
 # ---------------------------------------------------------------------------
 
-def run_attribution_compare_pipeline(link_code: str | None = None) -> dict[str, Any]:
-    """读取归因 fixtures，按触点类型做首次/末次/线性权重分配，生成指标对比产物。"""
+def run_attribution_compare_pipeline(
+    link_code: str | None = None, window: str | None = None
+) -> dict[str, Any]:
+    """读取归因 fixtures，按链路配置的归因窗口计算首次/末次/线性权重并生成对比产物。
+
+    窗口口径来自归因链路的「归因窗口」业务配置，可用 window 显式覆盖。
+    成交动作（下单）不参与分配；窗口内无合格触点的订单保留为未归因转化，
+    结果自带成交范围（scope）与对账信息（reconciliation）。
+    """
     touches = list(ATTRIBUTION_TOUCHES)
     if link_code is None:
         link_code = "ATTR-001"
@@ -406,78 +414,79 @@ def run_attribution_compare_pipeline(link_code: str | None = None) -> dict[str, 
     if not link_touches:
         return {"error": "链路无数据"}
 
-    # 按 user_id 聚合
-    users: dict[str, list[dict]] = {}
-    for t in link_touches:
-        uid = t["user_id"]
-        users.setdefault(uid, []).append(t)
+    # 从 attribution 模块读取链路配置的窗口口径。
+    configured_window = window
+    if configured_window is None:
+        link_entry = next(
+            (row for row in store.rows("attribution") if row.get("链路编号") == link_code),
+            None,
+        )
+        if link_entry is not None:
+            configured_window = link_entry.get("归因窗口")
 
-    # 三种归因模型
-    first_touch: dict[str, float] = {}
-    last_touch: dict[str, float] = {}
-    linear_touch: dict[str, float] = {}
+    # 混合流水拆单：下单事件携带成交时间与金额，其余为可分配触点。
+    orders: list[dict[str, Any]] = []
+    raw_touches: list[dict[str, Any]] = []
+    order_seq = 0
+    for row in link_touches:
+        if row.get("触点类型") == "下单":
+            order_seq += 1
+            orders.append({
+                "order_id": f"{link_code}-ORDER-{order_seq}",
+                "amount": row.get("贡献金额", 0.0),
+                "conversion_time": row.get("touch_time"),
+                "user_id": row.get("user_id"),
+            })
+        else:
+            # 触点挂在「当前已出现的下单事件」上；流水里下单位于触点之后时归到第 1 单。
+            owner_seq = order_seq if order_seq > 0 else 1
+            raw_touches.append({
+                "order_id": f"{link_code}-ORDER-{owner_seq}",
+                "channel": row.get("触点类型"),
+                "touch_time": row.get("touch_time"),
+                "touch_id": row.get("触点序号"),
+                "user_id": row.get("user_id"),
+            })
 
-    for uid, ts in users.items():
-        ts_sorted = sorted(ts, key=lambda x: x["触点序号"])
-        conv_amount = _to_float(ts_sorted[-1].get("贡献金额"))
-        if conv_amount <= 0:
-            continue
-        # 首次
-        ft = ts_sorted[0]["触点类型"]
-        first_touch[ft] = first_touch.get(ft, 0.0) + conv_amount
-        # 末次（转化事件前最后一个有效触点）
-        lt_candidates = [t for t in ts_sorted if t["触点类型"] != "下单"]
-        if lt_candidates:
-            lt = lt_candidates[-1]["触点类型"]
-            last_touch[lt] = last_touch.get(lt, 0.0) + conv_amount
-        # 线性
-        n = len([t for t in ts_sorted if t["触点类型"] != "下单"])
-        if n > 0:
-            share = conv_amount / n
-            for t in ts_sorted:
-                if t["触点类型"] != "下单":
-                    linear_touch[t["触点类型"]] = linear_touch.get(t["触点类型"], 0.0) + share
+    result = compute_attribution(orders, raw_touches, configured_window)
 
-    # 归一化到指标定义口径
-    total_first = sum(first_touch.values())
-    total_last = sum(last_touch.values())
-    total_linear = sum(linear_touch.values())
-
-    result = {
+    output = {
         "link_code": link_code,
-        "user_count": len(users),
-        "models": {
-            "first_touch": {k: round(v, 2) for k, v in first_touch.items()},
-            "last_touch": {k: round(v, 2) for k, v in last_touch.items()},
-            "linear": {k: round(v, 2) for k, v in linear_touch.items()},
+        "window": result["window"],
+        "user_count": len({order["user_id"] for order in orders if order.get("user_id")}),
+        "models": result["models"],
+        "totals": {model: result["model_summaries"][model]["allocated"] for model in MODELS},
+        "scope": result["scope"],
+        "uncovered": {
+            model: result["model_summaries"][model]["uncovered"] for model in MODELS
         },
-        "totals": {
-            "first_touch": round(total_first, 2),
-            "last_touch": round(total_last, 2),
-            "linear": round(total_linear, 2),
-        },
+        "reconciliation": result["reconciliation"],
+        "orders": result["orders"],
     }
 
-    # 写入对比任务可消费的差异数据
+    # 写入对比任务可消费的差异数据（保留旧契约的 触点类型/首次归因/末次归因/差异 字段）。
     diffs: list[dict] = []
-    all_types = set(first_touch) | set(last_touch) | set(linear_touch)
-    for t in all_types:
+    all_types = set().union(*(set(result["models"][model]) for model in MODELS))
+    first_touch = result["models"]["first_touch"]
+    last_touch = result["models"]["last_touch"]
+    for t in sorted(all_types):
         f = first_touch.get(t, 0.0)
         l = last_touch.get(t, 0.0)
         diffs.append({
             "触点类型": t,
-            "首次归因": round(f, 2),
-            "末次归因": round(l, 2),
+            "首次归因": f,
+            "末次归因": l,
             "差异": round(abs(f - l), 2),
         })
-    result["compare_rows"] = diffs
+    output["compare_rows"] = diffs
+    output["model_labels"] = MODEL_LABELS
 
     _write_result("attribution_metric_compare", {
         "source_modules": ["attribution", "metric_def"],
         "target_module": "compare_job",
-        "payload": result,
+        "payload": output,
     })
-    return result
+    return output
 
 
 # ---------------------------------------------------------------------------

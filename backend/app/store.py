@@ -17,7 +17,8 @@ class Store:
         self._tables.setdefault("_pipeline_results", [])
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        # 下划线开头的是内部命名空间（如管道产物、归因批次），不计入业务模块。
+        return sorted(name for name in self._tables if not name.startswith("_"))
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
